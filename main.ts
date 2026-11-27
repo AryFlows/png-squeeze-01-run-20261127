@@ -8,16 +8,21 @@
 //   3. Screen every (form, filter choice) at zlib level 6: fixed filter 0, the
 //      minimum-sum heuristic, a fewest-distinct-pairs heuristic, and brute force
 //      (each row's filter picked by its real deflate cost against the preceding
-//      32 KiB as dictionary).
-//   4. Final-encode the best two candidates with zlib level 9 and with a lazy
-//      LZ77 + dynamic-Huffman deflate of my own, and the best candidate also
-//      with an optimal-parse (shortest-path) deflate whose Huffman costs come
-//      from the lazy parse. Keep the smallest stream; write one IDAT.
+//      32 KiB as dictionary) — brute force only on the non-palette form, where it
+//      ever wins; on palette forms fixed 0 always beat it on the practice set.
+//   4. Final-encode the best two candidates with zlib level 9, and the best
+//      candidate also with a lazy LZ77 + dynamic-Huffman deflate of my own.
+//      An optimal-parse (shortest-path) deflate, whose Huffman costs come from
+//      the lazy parse, runs only when the best level-6 size is over 80 KiB:
+//      on the practice set it only ever won on the three largest outputs, and
+//      it costs ~45% of the whole run. Keep the smallest stream; write one IDAT.
+// Speed (v2): the v1 entry timed out on the grader (1 CPU, 60 s wall) at ~40 s
+// locally, so the expensive passes are gated to where they pay for themselves.
 // Deterministic: no clock, no environment, no randomness; the same input bytes
 // always produce the same output bytes.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { inflateSync, deflateSync, constants } from 'node:zlib';
+import { inflateSync, deflateSync } from 'node:zlib';
 
 // ---------- PNG chunk writing ----------
 const CRC_TABLE = (() => {
@@ -287,7 +292,7 @@ function formsOf(rgba) {
   if (colours !== null) {
     for (const order of ['count', 'luminance', 'first']) {
       const p = paletteForm(rgba, colours, order);
-      forms.push({ colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns, filters: order === 'count' ? [0, 'minsum', 'brute'] : ['minsum', 'brute'] });
+      forms.push({ colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns, filters: order === 'count' ? [0, 'minsum'] : ['minsum'] });
     }
     if (!grey) return forms;
   }
@@ -689,7 +694,11 @@ function zdeflate(data) {
 // code built on the lazy parse, so distances are priced as the emitted stream
 // prices them (fixed-Huffman costs would underprice far matches). Block-local DP:
 // a match may reference earlier blocks, never extend past its block's end.
-const DP_CHAIN = 256;
+const DP_CHAIN = 64;
+// Optimal-parse runs only on large outputs: on the practice set it never won
+// on an instance whose best level-6 size was under 64 KiB, so skipping it
+// there costs almost nothing and saves nearly half the run.
+const DP_MIN_Z6 = 80000;
 const DP_BLOCK = 262144;
 const BOUNDS = [3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 22, 26, 30, 34, 42, 50, 58, 66, 82, 98, 114, 130, 162, 194, 226, 257, 258];
 function trueCosts(litLens, distLens) {
@@ -724,7 +733,7 @@ function dpBlock(d, lo, hi, head, prev, costs, lenCost) {
         if (len > bestLen) {
           bestLen = len; bestDist = i - cand;
           if (len >= 128) break;
-          if (len >= 32) chainLimit = Math.min(chainLimit, 256);
+          if (len >= 32) chainLimit = Math.min(chainLimit, DP_CHAIN);
           if (len >= maxLen) break;
         }
       }
@@ -802,12 +811,6 @@ function dpParse(d, costs) {
 }
 
 // ---------- final encoding of one image ----------
-function bestDeflate(data) {
-  let best = deflateSync(data, { level: 9, memLevel: 9, strategy: constants.Z_DEFAULT_STRATEGY });
-  const zz = zdeflate(data);
-  if (zz.length < best.length) best = zz;
-  return best;
-}
 function dpDeflate(data, costs) {
   const parsed = dpParse(data, costs);
   let best = null;
@@ -834,19 +837,25 @@ function encode(rgba, width, height) {
     const bytes = z.length + CHUNK(form);
     if (best === null || bytes < best.bytes) best = { form, z, bytes };
   };
+  // The second candidate only gets zlib level 9: on the practice set the lazy
+  // parse of the top candidate always beat the second candidate's best deflate
+  // (the one 15-byte exception was beaten by the DP pass anyway), so spending
+  // a second lazy parse there buys nothing.
   for (const c of cands.slice(0, 2)) {
-    if (c === cands[0]) consider(c.form, deflateSync(c.data, { level: 9, memLevel: 9 })); // lazy+DP below cover this one
-    else consider(c.form, bestDeflate(c.data));
+    consider(c.form, deflateSync(c.data, { level: 9, memLevel: 9 }));
   }
   // Optimal-parse deflate on the top candidate, with true Huffman costs taken
-  // from the lazy parse (one DP run; the lazy parse is reused, not redone).
+  // from the lazy parse (one DP run; the lazy parse is reused, not redone) —
+  // gated to large outputs, where it is the only place it ever won.
   const top = cands[0];
   const lp = lazyParse(top.data);
   consider(top.form, zdeflateFromParsed(lp, top.data));
-  const litFreq = new Uint32Array(288), distFreq = new Uint32Array(30);
-  for (let k = 0; k < lp.count; k++) { litFreq[lp.sym[k]]++; if (lp.sym[k] >= 257) distFreq[lp.dist[k] >> 13]++; }
-  const litLens = huffmanLengths(litFreq, 15), distLens = huffmanLengths(distFreq, 15);
-  if (litLens !== null && distLens !== null) consider(top.form, dpDeflate(top.data, trueCosts(litLens, distLens)));
+  if (top.bytes > DP_MIN_Z6) {
+    const litFreq = new Uint32Array(288), distFreq = new Uint32Array(30);
+    for (let k = 0; k < lp.count; k++) { litFreq[lp.sym[k]]++; if (lp.sym[k] >= 257) distFreq[lp.dist[k] >> 13]++; }
+    const litLens = huffmanLengths(litFreq, 15), distLens = huffmanLengths(distFreq, 15);
+    if (litLens !== null && distLens !== null) consider(top.form, dpDeflate(top.data, trueCosts(litLens, distLens)));
+  }
   return pngOfForm(width, height, best.form, best.z);
 }
 
